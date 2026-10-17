@@ -11,6 +11,7 @@ class Session {
     this.gradesChucNangId = '',
   });
 
+  /// JWT portal nếu có; phiên cookie được xác minh trong WebView có thể rỗng.
   final String token;
   final String userId;
 

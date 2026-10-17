@@ -76,14 +76,16 @@ PortalResponse parseResponse(String body) {
   return PortalResponse(data, message);
 }
 
-/// Gọi portal giống `edu.system.makeRequest` (systemroot.js): form POST tới
-/// `<origin><base>/<action>` kèm JWT dạng Bearer và cookie của portal.
+/// Đóng gói form giống `edu.system.makeRequest` (systemroot.js).
+/// App dùng PortalWebClient để request chạy trong phiên trình duyệt đã đăng nhập;
+/// HTTP client trực tiếp chỉ dành cho kiểm thử/công cụ với phiên được hỗ trợ.
 class PortalApi {
   PortalApi({
     required this.session,
     required this.userAgent,
     required this.cookieHeader,
     http.Client? client,
+    this.browserManagedSession = false,
     void Function(String message)? diagnosticLog,
   }) : _client = client ?? http.Client(),
        _diagnosticLog = diagnosticLog ?? _logDiagnostic;
@@ -92,6 +94,7 @@ class PortalApi {
   final String userAgent;
   final Future<String?> Function(Uri url) cookieHeader;
   final http.Client _client;
+  final bool browserManagedSession;
   final void Function(String message) _diagnosticLog;
 
   static void _logDiagnostic(String message) =>
@@ -112,7 +115,11 @@ class PortalApi {
     });
     final key = action.substring(action.indexOf('/') + 1);
     final body = await _post(action, {'A': PortalCrypto.encrypt(payload, key)});
-    return parseSchedule(parseResponse(body).data);
+    final data = parseResponse(body).data;
+    if (data is! List) {
+      throw PortalException('Không đọc được lịch học từ cổng sinh viên.');
+    }
+    return parseSchedule(data);
   }
 
   Future<Object?> _academicRequest(
@@ -224,13 +231,16 @@ class PortalApi {
     final headers = <String, String>{
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'Accept': 'application/json, text/javascript, */*; q=0.01',
-      if (session.token.isNotEmpty) 'Authorization': 'Bearer ${session.token}',
-      'User-Agent': userAgent,
-      'Origin': portalOrigin,
-      'Referer': '$portalOrigin/congthongtin/Index.aspx',
+      if (!browserManagedSession && session.token.isNotEmpty)
+        'Authorization': 'Bearer ${session.token}',
+      if (!browserManagedSession) ...{
+        'User-Agent': userAgent,
+        'Origin': portalOrigin,
+        'Referer': '$portalOrigin/congthongtin/Index.aspx',
+      },
       'X-Requested-With': 'XMLHttpRequest',
     };
-    final cookie = await cookieHeader(url);
+    final cookie = browserManagedSession ? null : await cookieHeader(url);
     if (cookie != null && cookie.isNotEmpty) headers['Cookie'] = cookie;
     final http.Response res;
     try {
@@ -249,10 +259,11 @@ class PortalApi {
       // Chỉ ghi loại request và cờ hiện diện, không tokenTail/cookie/ID/body.
       _diagnosticLog(
         '[auth] http_401 api=${action.split('/').first} '
-        'bearerPresent=${session.token.isNotEmpty} '
-        'cookiePresent=${cookie != null && cookie.isNotEmpty} '
-        'userAgentPresent=${userAgent.isNotEmpty} '
-        'refererPresent=${headers.containsKey('Referer')} '
+        'transport=${browserManagedSession ? 'webview' : 'native'} '
+        'bearerPresent=${browserManagedSession ? 'browser_managed' : session.token.isNotEmpty} '
+        'cookiePresent=${browserManagedSession ? 'browser_managed' : cookie != null && cookie.isNotEmpty} '
+        'userAgentPresent=${browserManagedSession ? 'browser_managed' : userAgent.isNotEmpty} '
+        'refererPresent=${browserManagedSession ? 'browser_managed' : headers.containsKey('Referer')} '
         'ajaxHeaderPresent=${headers.containsKey('X-Requested-With')}',
       );
       throw SessionExpiredException();

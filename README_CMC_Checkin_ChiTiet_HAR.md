@@ -163,7 +163,7 @@ https://iu.cmcu.edu.vn/chuyencanapi/api/CC_ThongTin/Them_QLSV_NguoiHoc_TuGhiNhan
 
 ### 3.2 Header HTTP và khác biệt được ghi nhận trong HAR
 
-**Cập nhật mã chạy (#4):** Client Dart trong `lib/` đã bổ sung `Referer`, `X-Requested-With` và thu `navigator.userAgent` từ trang login. Chính sách giữ cookie sau 401 trong các code sample Swift/Dart bên dưới là thiết kế cũ; không dùng nguyên mẫu đó để thay thế `SessionRecovery` hiện tại. Xem mục phục hồi phiên trong `README.md`.
+**Cập nhật mã chạy:** App trong `lib/` dùng `PortalWebClient` để gửi API ngay trong WebView đã đăng nhập, giữ cookie/UA/ngữ cảnh trình duyệt; chỉ mở lịch sau khi API xác minh thành công. Client Dart HTTP trực tiếp và chính sách giữ cookie sau 401 trong code sample Swift/Dart bên dưới là thiết kế cũ; không dùng nguyên mẫu đó để thay thế bridge và `SessionRecovery` hiện tại. Xem `README.md` và `docs/AUTH_TESTING.md`.
 
 **[README gốc / mã tham khảo]** Bảng dưới phản ánh cách tác giả README xây HTTP client và hành vi *có điều kiện* trong JavaScript portal. **[HAR thực tế]** Hai POST nghiệp vụ quan sát được **không** mang `Authorization` hoặc `Cookie` trong danh sách request headers của HAR. `systemroot.js` chỉ thêm Authorization khi có `tokenJWT`. Vì vậy, không nên coi toàn bộ header dưới đây là *bắt buộc trên mọi request* và cũng không được suy diễn rằng API có thể gọi không cần phiên đăng nhập. Thực hiện xác thực theo đúng phiên được portal hỗ trợ, không tự chế hoặc đoán token.
 

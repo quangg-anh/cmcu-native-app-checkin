@@ -44,6 +44,40 @@ void main() {
     },
   );
 
+  test(
+    'Browser-managed requests never export cookie or attach saved Bearer',
+    () async {
+      final lines = <String>[];
+      final api = PortalApi(
+        session: testSession,
+        userAgent: 'synthetic WebView user agent',
+        browserManagedSession: true,
+        cookieHeader: (_) async => fail('Must not export cookie'),
+        diagnosticLog: lines.add,
+        client: MockClient((request) async {
+          for (final name in [
+            'Authorization',
+            'Cookie',
+            'User-Agent',
+            'Origin',
+            'Referer',
+          ]) {
+            expect(request.headers, isNot(contains(name)));
+          }
+          return http.Response('', 401);
+        }),
+      );
+      addTearDown(api.close);
+      await expectLater(
+        api.weekSchedule(DateTime(2026, 10, 12), DateTime(2026, 10, 18)),
+        throwsA(isA<SessionExpiredException>()),
+      );
+      expect(lines.single, contains('transport=webview'));
+      expect(lines.single, contains('cookiePresent=browser_managed'));
+      expect(lines.single, isNot(contains(testSession.token)));
+    },
+  );
+
   for (final cookie in [null, 'portal_session=secret-test-cookie']) {
     test(
       'HTTP 401 is not retried; diagnostics redact credentials (cookie=${cookie != null})',

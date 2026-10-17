@@ -35,7 +35,7 @@ class SessionRecovery {
   /// Không gửi lại token đã bị API từ chối, kể cả portal tự vào Index.aspx.
   bool acceptToken(String token) {
     if (resetting || blocked) return false;
-    if (!_rejectedTokens.contains(token)) return true;
+    if (token.isEmpty || !_rejectedTokens.contains(token)) return true;
     _repeatedToken = true;
     _notice =
         'Cổng sinh viên trả lại phiên đăng nhập cũ đã bị từ chối. '
@@ -47,7 +47,10 @@ class SessionRecovery {
   Future<void> expire(Session session) {
     final pending = _resetFuture;
     if (pending != null) return pending;
-    final repeated = !_rejectedTokens.add(session.token);
+    // Phiên cookie có thể không có JWT. Chuỗi rỗng không định danh phiên;
+    // vẫn giới hạn số lần thất bại, không coi mọi phiên cookie là cùng token.
+    final repeated =
+        session.token.isNotEmpty && !_rejectedTokens.add(session.token);
     _failures++;
     _repeatedToken = repeated;
     _notice = blocked

@@ -39,6 +39,29 @@ Nếu đang dùng phiên đăng nhập cũ, **đăng xuất rồi đăng nhập 
 
 Kiểm thử hồi quy nằm trong `test/session_recovery_test.dart`, `test/login_session_test.dart`, `test/portal_session_test.dart` và `test/web_session_test.dart`. Với bản sửa #4: Flutter 3.47.7 / Dart 3.13.5, `flutter analyze --no-pub` không có vấn đề; `flutter test --no-pub --timeout 45s` đạt **54 test** (31 test cũ + 23 test mới). CLI `tool/verify_har.dart` cũng chạy được bằng Dart thuần với HAR giả lập (1 chương trình, 3 học phần, 3 học kỳ). Không gọi portal thật, không dùng tài khoản hoặc dữ liệu sinh viên thật. Chưa xác minh SSO trên thiết bị thật hoặc build APK/IPA.
 
+### Giữ request trong phiên portal đã đăng nhập
+
+Bản tiếp theo xử lý chỗ chuyển từ WebView sang HTTP client native, thay vì chỉ dừng vòng lặp:
+
+- `PortalWebClient` gửi POST bằng `XMLHttpRequest` **ngay trong WebView đã đăng nhập**. WebView tự quản lý cookie HttpOnly/path/SameSite, UA, Origin, Referer; Bearer lấy từ `edu.system.tokenJWT` hiện tại nếu portal cấp. Không xuất cookie sang Dart, không dùng token Microsoft thay token portal, không thử bỏ Bearer sau 401.
+- WebView được giữ sống và ẩn bằng `Offstage` sau đăng nhập. Lịch, điểm và điểm danh dùng cùng client; cập nhật giao diện không tạo lại WebView/controller.
+- Chỉ lưu session và mở lịch sau khi API lịch trả HTTP 2xx, `Success == true`, giải mã được và `Data` là danh sách. Dữ liệu tuần xác minh được chuyển vào controller, tránh gọi lịch hai lần. Danh sách rỗng hợp lệ vẫn được chấp nhận; HTML đăng nhập, JSON sai cấu trúc hoặc `Success == false` không được coi là thành công.
+- Session lưu trên máy chỉ gợi ý mở lại `Index.aspx`. Mỗi lần mở app vẫn cần khôi phục ngữ cảnh portal và xác minh API trong WebView; không phát lại JWT cũ bằng HTTP client riêng. Phiên portal có user/menu nhưng không có JWT cũng phải vượt qua bước xác minh này.
+- Bridge chỉ cho phép 5 endpoint đang dùng, đúng HTTPS origin, POST, không query/fragment/userinfo; kiểm tra lại origin và user ID trong JavaScript trước khi gửi. Chuyển về trang login hoặc đổi tài khoản làm phiên hết hiệu lực. Không tự gửi lại POST điểm danh khi mạng lỗi/timeout.
+- HTTP 401 thật vẫn dùng `SessionRecovery`: hủy client/WebView cũ trước khi xóa cookie/storage, giới hạn phục hồi tự động, không bỏ xác thực. Lỗi mạng/5xx/sai phản hồi ở bước xác minh giữ màn đăng nhập và chờ người dùng bấm **Thử lại**. Tắt log sự kiện của plugin WebView cả ở debug để tránh lộ URL OAuth hoặc dữ liệu trả về qua JavaScript.
+
+Vẫn dùng Microsoft SSO do portal cung cấp trong WebView. Chưa chuyển sang Custom Tabs/ASWebAuthenticationSession vì redirect hiện tại trả về website trường; cần callback và cơ chế cấp phiên portal được backend hỗ trợ trước khi chuyển sang tab ngoài.
+
+Kiểm tra bổ sung:
+
+```sh
+flutter analyze --no-pub
+flutter test --no-pub --timeout 45s
+node --test tool/verify_portal_bridge.cjs
+```
+
+Kết quả bản mới: **85 test Flutter + 17 test JavaScript đạt**, `flutter analyze --no-pub` và `dart analyze` không có vấn đề (Flutter 3.47.7 / Dart 3.13.5, Node.js 22.23.2). `tool/verify_portal_bridge.cjs` chạy trực tiếp đoạn JavaScript trong `PortalWebClient` bằng XHR giả lập, không gọi mạng. Các test Flutter/JavaScript xác minh mã và luồng giả lập, **không chứng minh portal thực tế đã hết 401**. Chưa có tài khoản/thiết bị để kiểm tra Microsoft SSO, cookie native WebView, tải lịch/điểm hoặc build APK/IPA. Xem checklist trong `docs/AUTH_TESTING.md` trước khi phát hành.
+
 HAR cục bộ có thể kiểm tra offline:
 
 ```sh

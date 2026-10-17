@@ -71,7 +71,7 @@ class AuthGate extends StatefulWidget {
 class _AuthGateState extends State<AuthGate> {
   Session? _session;
   ScheduleController? _controller;
-  bool _creatingController = false;
+  bool _restoreSession = false;
   bool _resettingSession = false;
   bool _checkInRequested = false;
   int _loginGeneration = 0;
@@ -81,8 +81,9 @@ class _AuthGateState extends State<AuthGate> {
   @override
   void initState() {
     super.initState();
-    _session = widget.initialSession;
-    if (_session != null) _createController(_session!);
+    // Session đã lưu chỉ là gợi ý mở Index.aspx. Phải lấy lại ngữ cảnh portal
+    // và xác minh API trong WebView trước khi hiển thị dữ liệu tài khoản.
+    _restoreSession = widget.initialSession != null;
     _listenDeepLinks();
   }
 
@@ -109,61 +110,62 @@ class _AuthGateState extends State<AuthGate> {
     }
   }
 
-  /// Tạo controller rồi mới công bố [s] trong cùng một `setState`, nên không có
-  /// frame nào vừa có phiên vừa chưa có controller (không nhấp nháy spinner).
-  Future<void> _createController(Session s) async {
-    if (_creatingController) return;
-    _creatingController = true;
+  Future<void> _onSignedIn(
+    int generation,
+    Session session,
+    PortalApi api,
+    DateTime week,
+    List<ScheduleEntry> entries,
+  ) async {
+    if (!mounted ||
+        _resettingSession ||
+        generation != _loginGeneration ||
+        !_recovery.acceptToken(session.token)) {
+      api.close();
+      return;
+    }
+    await SessionStore.save(session);
+    if (!mounted || _resettingSession || generation != _loginGeneration) {
+      api.close();
+      return;
+    }
+    final controller = ScheduleController(
+      api: api,
+      fallbackIp: session.portalIp,
+      initialWeekStart: week,
+      initialEntries: entries,
+      onCurrentWeekLoaded: (week, entries) {
+        _recovery.confirmAuthenticated();
+        _publishWeek(week, entries);
+      },
+    );
+    final old = _controller;
+    FocusManager.instance.primaryFocus?.unfocus();
+    _recovery.confirmAuthenticated();
+    setState(() {
+      _session = session;
+      _controller = controller;
+    });
+    old?.dispose();
+    old?.api.close();
+    // Không để lỗi widget phụ làm mất phiên đã được API xác minh.
+    unawaited(_publishWeek(week, entries));
+  }
+
+  Future<void> _publishWeek(DateTime week, List<ScheduleEntry> entries) async {
     try {
-      final generation = _loginGeneration;
-      final ua = await WebSession.userAgent();
-      if (_resettingSession || generation != _loginGeneration) return;
-      final existing = _controller;
-      if (existing != null && identical(existing.api.session, s)) return;
-      if (!mounted) return;
-      final api = PortalApi(
-        session: s,
-        userAgent: ua,
-        cookieHeader: WebSession.cookieHeader,
-        diagnosticLog: debugPrint,
+      await WidgetBridge.publish(
+        signedIn: true,
+        weekStart: week,
+        entries: entries,
       );
-      final controller = ScheduleController(
-        api: api,
-        fallbackIp: s.portalIp,
-        onCurrentWeekLoaded: (week, entries) {
-          _recovery.confirmAuthenticated();
-          WidgetBridge.publish(
-            signedIn: true,
-            weekStart: week,
-            entries: entries,
-          );
-        },
-      );
-      final old = _controller;
-      setState(() {
-        _session = s;
-        _controller = controller;
-      });
-      old?.dispose();
-      old?.api.close();
-    } finally {
-      _creatingController = false;
+    } catch (_) {
+      debugPrint('[widget] publish_failed');
     }
   }
 
-  Future<void> _onSignedIn(Session s) async {
-    if (_resettingSession || !_recovery.acceptToken(s.token)) return;
-    final generation = _loginGeneration;
-    await SessionStore.save(s);
-    if (!mounted || _resettingSession || generation != _loginGeneration) return;
-    await _createController(s);
-    if (mounted && identical(_session, s) && !_resettingSession) {
-      await WidgetBridge.publish(signedIn: true);
-    }
-  }
-
-  Future<void> _onSessionExpired() async {
-    final session = _session;
+  Future<void> _onSessionExpired([Session? candidate]) async {
+    final session = candidate ?? _session;
     if (session == null || _resettingSession) return;
     await _resetSession(() => _recovery.expire(session));
   }
@@ -178,12 +180,16 @@ class _AuthGateState extends State<AuthGate> {
       _loginGeneration++;
       _session = null;
       _controller = null;
+      _restoreSession = false;
       _checkInRequested = false;
     });
     // Chặn kết quả request đang chạy trước khi dọn session/cookie.
     old?.dispose();
     old?.api.close();
     try {
+      // Chờ WebView cũ bị hủy trong frame kế tiếp trước khi xóa cookie/storage;
+      // trang còn sống có thể ghi lại dữ liệu phiên trong lúc đang dọn.
+      await WidgetsBinding.instance.endOfFrame;
       await reset();
     } finally {
       if (mounted) setState(() => _resettingSession = false);
@@ -193,29 +199,51 @@ class _AuthGateState extends State<AuthGate> {
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
-    if (_session == null) {
-      return LoginScreen(
-        key: ValueKey(_loginGeneration),
-        onSignedIn: _onSignedIn,
-        onUserAgentCaptured: WebSession.rememberUserAgent,
-        acceptToken: _recovery.acceptToken,
-        resetting: _resettingSession,
-        blocked: _recovery.blocked,
-        sessionNotice: _recovery.notice,
-        onRetrySession: _onSignOut,
-      );
-    }
-    if (controller == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-    return ScheduleScreen(
-      key: ValueKey(_session!.token),
-      controller: controller,
-      preferences: widget.preferences,
-      checkInRequested: _checkInRequested,
-      onCheckInRequestHandled: () => setState(() => _checkInRequested = false),
-      onSignOut: _onSignOut,
-      onSessionExpired: _onSessionExpired,
+    final generation = _loginGeneration;
+    final signedIn = _session != null && controller != null;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // Giữ nguyên phần tử WebView sau khi đăng nhập; Offstage chỉ ẩn UI,
+        // không hủy phiên/cookie hay chuyển request sang HTTP client khác.
+        Offstage(
+          offstage: signedIn,
+          child: TickerMode(
+            enabled: !signedIn,
+            child: ExcludeFocus(
+              excluding: signedIn,
+              child: LoginScreen(
+                key: ValueKey(generation),
+                restoreSession: _restoreSession,
+                onSignedIn: (session, api, week, entries) =>
+                    _onSignedIn(generation, session, api, week, entries),
+                onSessionExpired: (session) async {
+                  if (generation == _loginGeneration) {
+                    await _onSessionExpired(session);
+                  }
+                },
+                onUserAgentCaptured: WebSession.rememberUserAgent,
+                acceptToken: _recovery.acceptToken,
+                resetting: _resettingSession,
+                blocked: _recovery.blocked,
+                sessionNotice: _recovery.notice,
+                onRetrySession: _onSignOut,
+              ),
+            ),
+          ),
+        ),
+        if (signedIn)
+          ScheduleScreen(
+            key: ValueKey(generation),
+            controller: controller,
+            preferences: widget.preferences,
+            checkInRequested: _checkInRequested,
+            onCheckInRequestHandled: () =>
+                setState(() => _checkInRequested = false),
+            onSignOut: _onSignOut,
+            onSessionExpired: _onSessionExpired,
+          ),
+      ],
     );
   }
 }

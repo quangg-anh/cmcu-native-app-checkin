@@ -7,7 +7,8 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/models.dart';
 import '../../theme/campus_brand.dart';
-import '../../core/portal_api.dart' show portalOrigin;
+import '../../core/portal_api.dart';
+import '../../core/portal_web_client.dart';
 
 const _loginUrl = '$portalOrigin/congthongtin/login.aspx';
 const _probeInterval = Duration(milliseconds: 700);
@@ -16,8 +17,9 @@ const _menuWaitProbes = 15;
 const _probeJs = r'''
 (function () {
   try {
+    if (location.origin !== 'https://iu.cmcu.edu.vn') return null;
     var s = (typeof edu !== 'undefined' && edu) ? edu.system : null;
-    if (!s || !s.tokenJWT || !s.userId) return null;
+    if (!s || !s.userId) return null;
     var list = s.dtChucNang || [], match = null, grades = null;
     for (var i = 0; i < list.length; i++) {
       var file = String(list[i].DUONGDANFILE || '').toLowerCase();
@@ -26,7 +28,8 @@ const _probeJs = r'''
       if (file.indexOf('diemhoc') >= 0 || name.indexOf('điểm học') >= 0 || name.indexOf('kết quả học tập') >= 0) grades = list[i].ID;
     }
     return JSON.stringify({
-      token: s.tokenJWT, userId: s.userId, clientIP: s.clientIP || '',
+      token: typeof s.tokenJWT === 'string' ? s.tokenJWT : '',
+      userId: String(s.userId), clientIP: s.clientIP || '',
       chucNangId: match == null ? null : String(match),
       gradesChucNangId: grades == null ? '' : String(grades),
       currentChucNangId: s.strChucNang_Id || '', menuLoaded: list.length > 0,
@@ -40,16 +43,26 @@ class LoginScreen extends StatefulWidget {
   const LoginScreen({
     super.key,
     required this.onSignedIn,
+    this.onSessionExpired,
     this.onUserAgentCaptured,
+    this.restoreSession = false,
     this.acceptToken,
     this.resetting = false,
     this.blocked = false,
     this.sessionNotice,
     this.onRetrySession,
   });
-  final void Function(Session session) onSignedIn;
+  final Future<void> Function(
+    Session session,
+    PortalApi api,
+    DateTime weekStart,
+    List<ScheduleEntry> entries,
+  )
+  onSignedIn;
+  final Future<void> Function(Session session)? onSessionExpired;
   final Future<void> Function(String userAgent)? onUserAgentCaptured;
   final bool Function(String token)? acceptToken;
+  final bool restoreSession;
   final bool resetting;
   final bool blocked;
   final String? sessionNotice;
@@ -61,6 +74,9 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen> {
   InAppWebViewController? _web;
+  // Package tạo platform view ngay trong constructor. Cache cả widget để
+  // setState/progress/Offstage không thay controller hoặc làm mất phiên gốc.
+  late final InAppWebView _loginWebView = _createWebView();
   double _progress = 0;
   bool _canGoBack = false;
   Timer? _timer;
@@ -68,11 +84,23 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _probing = false;
   bool _menuError = false;
   bool _tokenRejected = false;
+  bool _validating = false;
+  String? _validationError;
+  PortalApi? _candidateApi;
   int _probesWithToken = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Package có thể log URL OAuth và kết quả JavaScript chứa dữ liệu cá nhân
+    // ở debug mode. Chỉ dùng diagnostics đã lược bỏ dữ liệu của app.
+    PlatformInAppWebViewController.debugLoggingSettings.enabled = false;
+  }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _candidateApi?.close();
     super.dispose();
   }
 
@@ -85,6 +113,7 @@ class _LoginScreenState extends State<LoginScreen> {
   void _retry() {
     setState(() {
       _menuError = false;
+      _validationError = null;
       _probesWithToken = 0;
     });
     _startProbe();
@@ -104,7 +133,9 @@ class _LoginScreenState extends State<LoginScreen> {
     _probing = true;
     try {
       final uri = await web.getUrl();
-      if (uri?.host != 'iu.cmcu.edu.vn' || uri?.scheme != 'https') return;
+      if (!mounted || widget.resetting || widget.blocked) return;
+      if (uri == null || Uri.parse(uri.toString()).origin != portalOrigin)
+        return;
       final raw = await web.evaluateJavascript(source: _probeJs);
       if (raw is! String ||
           _done ||
@@ -113,10 +144,9 @@ class _LoginScreenState extends State<LoginScreen> {
           widget.blocked)
         return;
       final obj = jsonDecode(raw) as Map<String, dynamic>;
-      final token = obj['token'] as String?;
+      final token = obj['token'] as String? ?? '';
       final userId = obj['userId'] as String?;
-      if (token == null || token.isEmpty || userId == null || userId.isEmpty)
-        return;
+      if (userId == null || userId.isEmpty) return;
       final chucNangId = obj['chucNangId'] as String?;
       final menuLoaded = obj['menuLoaded'] == true;
       final gradesId = obj['gradesChucNangId'] as String? ?? '';
@@ -133,19 +163,16 @@ class _LoginScreenState extends State<LoginScreen> {
         final userAgent = obj['userAgent'] as String? ?? '';
         await widget.onUserAgentCaptured?.call(userAgent);
         if (!mounted || widget.resetting || widget.blocked) return;
-        _done = true;
-        _timer?.cancel();
-        widget.onSignedIn(
-          Session(
-            token: token,
-            userId: userId,
-            chucNangId: scheduleId,
-            portalIp: obj['clientIP'] as String? ?? '',
-            // Tài khoản không có mục Điểm học vẫn dùng được lịch; tab Kết quả
-            // tự báo lỗi khi `gradesChucNangId` rỗng.
-            gradesChucNangId: gradesId,
-          ),
+        final session = Session(
+          token: token,
+          userId: userId,
+          chucNangId: scheduleId,
+          portalIp: obj['clientIP'] as String? ?? '',
+          // Tài khoản không có mục Điểm học vẫn dùng được lịch; tab Kết quả
+          // tự báo lỗi khi `gradesChucNangId` rỗng.
+          gradesChucNangId: gradesId,
         );
+        await _validate(session, userAgent, web);
       } else if (timedOut) {
         _timer?.cancel();
         setState(() => _menuError = true);
@@ -159,12 +186,69 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _validate(
+    Session session,
+    String userAgent,
+    InAppWebViewController web,
+  ) async {
+    _timer?.cancel();
+    setState(() {
+      _validating = true;
+      _validationError = null;
+    });
+    final api = PortalApi(
+      session: session,
+      userAgent: userAgent,
+      // WebView tự quản lý cookie HttpOnly/path/SameSite, không xuất cookie.
+      cookieHeader: (_) async => null,
+      client: PortalWebClient(web: web, userId: session.userId),
+      browserManagedSession: true,
+      diagnosticLog: debugPrint,
+    );
+    _candidateApi = api;
+    try {
+      final week = startOfWeek(DateTime.now());
+      final entries = await api.weekSchedule(
+        week,
+        week.add(const Duration(days: 6)),
+      );
+      if (!mounted || widget.resetting || widget.blocked) return;
+      // Chỉ API hợp lệ mới được lưu session/chuyển màn hình. Cùng WebView và
+      // cùng client tiếp tục phục vụ lịch, điểm, điểm danh sau khi đăng nhập.
+      await widget.onSignedIn(session, api, week, entries);
+      _candidateApi = null; // Quyền đóng client chuyển cho AuthGate.
+      _done = true;
+    } on SessionExpiredException {
+      if (!mounted || widget.resetting || widget.blocked) return;
+      if (widget.onSessionExpired != null) {
+        await widget.onSessionExpired!(session);
+      } else {
+        setState(() => _tokenRejected = true);
+      }
+    } on PortalException catch (error) {
+      if (mounted) setState(() => _validationError = error.message);
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _validationError =
+              'Không thể xác minh phiên đăng nhập. Vui lòng thử lại.';
+        });
+      }
+    } finally {
+      if (identical(_candidateApi, api)) {
+        api.close();
+        _candidateApi = null;
+      }
+      if (mounted) setState(() => _validating = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: !_canGoBack,
+      canPop: _done || !_canGoBack,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _canGoBack) _web?.goBack();
+        if (!didPop && !_done && _canGoBack) _web?.goBack();
       },
       child: Scaffold(
         appBar: AppBar(
@@ -195,51 +279,7 @@ class _LoginScreenState extends State<LoginScreen> {
             ? _sessionBlocked(context)
             : Stack(
                 children: [
-                  InAppWebView(
-                    initialUrlRequest: URLRequest(url: WebUri(_loginUrl)),
-                    initialSettings: InAppWebViewSettings(
-                      javaScriptEnabled: true,
-                      domStorageEnabled: true,
-                      thirdPartyCookiesEnabled: true,
-                      javaScriptCanOpenWindowsAutomatically: true,
-                      supportMultipleWindows: false,
-                      allowsBackForwardNavigationGestures: true,
-                      useShouldOverrideUrlLoading: true,
-                    ),
-                    onWebViewCreated: (c) {
-                      _web = c;
-                      _startProbe();
-                    },
-                    onProgressChanged: (_, p) {
-                      if (mounted) setState(() => _progress = p / 100);
-                    },
-                    onUpdateVisitedHistory: (c, _, __) async {
-                      final can = await c.canGoBack();
-                      if (mounted && can != _canGoBack)
-                        setState(() => _canGoBack = can);
-                    },
-                    shouldOverrideUrlLoading: (c, action) async {
-                      final uri = action.request.url;
-                      final scheme = uri?.scheme.toLowerCase();
-                      if (uri == null ||
-                          const {
-                            'http',
-                            'https',
-                            'about',
-                            'data',
-                            'blob',
-                          }.contains(scheme)) {
-                        return NavigationActionPolicy.ALLOW;
-                      }
-                      try {
-                        await launchUrl(
-                          Uri.parse(uri.toString()),
-                          mode: LaunchMode.externalApplication,
-                        );
-                      } catch (_) {}
-                      return NavigationActionPolicy.CANCEL;
-                    },
-                  ),
+                  _loginWebView,
                   if (widget.sessionNotice != null)
                     Align(
                       alignment: Alignment.topCenter,
@@ -251,12 +291,74 @@ class _LoginScreenState extends State<LoginScreen> {
                         ),
                       ),
                     ),
-                  if (_menuError) _menuErrorBanner(context),
+                  if (_menuError || _validationError != null)
+                    _errorBanner(context),
+                  if (_validating)
+                    Positioned.fill(
+                      child: ColoredBox(
+                        color: Theme.of(context).colorScheme.surface,
+                        child: const Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              CircularProgressIndicator(),
+                              SizedBox(height: 16),
+                              Text('Đang xác minh phiên và tải lịch học…'),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               ),
       ),
     );
   }
+
+  InAppWebView _createWebView() => InAppWebView(
+    initialUrlRequest: URLRequest(
+      url: WebUri(
+        widget.restoreSession
+            ? '$portalOrigin/congthongtin/Index.aspx'
+            : _loginUrl,
+      ),
+    ),
+    initialSettings: InAppWebViewSettings(
+      javaScriptEnabled: true,
+      domStorageEnabled: true,
+      thirdPartyCookiesEnabled: true,
+      javaScriptCanOpenWindowsAutomatically: true,
+      supportMultipleWindows: false,
+      allowsBackForwardNavigationGestures: true,
+      useShouldOverrideUrlLoading: true,
+    ),
+    onWebViewCreated: (c) {
+      _web = c;
+      _startProbe();
+    },
+    onProgressChanged: (_, p) {
+      if (mounted) setState(() => _progress = p / 100);
+    },
+    onUpdateVisitedHistory: (c, _, __) async {
+      final can = await c.canGoBack();
+      if (mounted && can != _canGoBack) setState(() => _canGoBack = can);
+    },
+    shouldOverrideUrlLoading: (c, action) async {
+      final uri = action.request.url;
+      final scheme = uri?.scheme.toLowerCase();
+      if (uri == null ||
+          const {'http', 'https', 'about', 'data', 'blob'}.contains(scheme)) {
+        return NavigationActionPolicy.ALLOW;
+      }
+      try {
+        await launchUrl(
+          Uri.parse(uri.toString()),
+          mode: LaunchMode.externalApplication,
+        );
+      } catch (_) {}
+      return NavigationActionPolicy.CANCEL;
+    },
+  );
 
   Widget _sessionBlocked(BuildContext context) {
     return Center(
@@ -299,7 +401,7 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  Widget _menuErrorBanner(BuildContext context) {
+  Widget _errorBanner(BuildContext context) {
     final s = Theme.of(context).colorScheme;
     return Align(
       alignment: Alignment.bottomCenter,
@@ -315,8 +417,9 @@ class _LoginScreenState extends State<LoginScreen> {
               children: [
                 Expanded(
                   child: Text(
-                    'Không đọc được mục “Lịch cá nhân” của tài khoản này. '
-                    'Kiểm tra lại quyền truy cập rồi thử lại.',
+                    _validationError ??
+                        'Không đọc được mục “Lịch cá nhân” của tài khoản này. '
+                            'Kiểm tra lại quyền truy cập rồi thử lại.',
                     style: TextStyle(color: s.onErrorContainer),
                   ),
                 ),

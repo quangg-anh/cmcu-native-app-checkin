@@ -47,6 +47,8 @@ class ScheduleController extends ChangeNotifier {
     required this.api,
     required this.fallbackIp,
     this.onCurrentWeekLoaded,
+    DateTime? initialWeekStart,
+    List<ScheduleEntry>? initialEntries,
     DateTime Function()? clock,
     Future<String?> Function()? ipLookup,
   }) : _clock = clock ?? DateTime.now,
@@ -54,6 +56,10 @@ class ScheduleController extends ChangeNotifier {
     final today = dateOnly(now);
     _selectedDay = today;
     _weekStart = startOfWeek(today);
+    if (initialWeekStart != null && initialEntries != null) {
+      _weeks[startOfWeek(initialWeekStart)] = initialEntries;
+      _updatedAt[startOfWeek(initialWeekStart)] = now;
+    }
     _load(force: false);
   }
 

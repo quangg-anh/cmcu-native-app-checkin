@@ -60,6 +60,25 @@ void main() {
     expect(calls, ['session', 'web', 'widget', 'session', 'web', 'widget']);
   });
 
+  test(
+    'Cookie-only sessions do not share empty-token identity; still stop after two 401s',
+    () async {
+      const cookieSession = Session(
+        token: '',
+        userId: 'synthetic-cookie-user',
+        chucNangId: 'schedule-menu',
+        portalIp: '',
+      );
+      await recovery.expire(cookieSession);
+      expect(recovery.acceptToken(''), isTrue);
+      expect(recovery.blocked, isFalse);
+      await recovery.expire(cookieSession);
+      expect(recovery.blocked, isTrue);
+      expect(recovery.acceptToken(''), isFalse);
+      expect(recovery.notice, contains('HTTP 401'));
+    },
+  );
+
   test('Only accepted API response resets consecutive failures', () async {
     await recovery.expire(testSession);
     recovery.confirmAuthenticated();
